@@ -1012,7 +1012,7 @@ def main():
     logger.info("Starting OTP bot...")
     _start_timed_restart_thread()
 
-    # ✅ FIX: never crash hard on Telegram startup timeouts; retry with backoff
+    # ✅ FIX: never crash hard on Telegram startup timeouts; retry with backoff hhh
     backoff = 2
     while True:
         try:
