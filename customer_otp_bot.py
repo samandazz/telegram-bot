@@ -18,6 +18,9 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.request import HTTPXRequest
 from telegram.error import Forbidden, RetryAfter, BadRequest, TimedOut, NetworkError
 
+# ✅ ADDED: Redis (shared storage for watcher watchlist)
+import redis.asyncio as redis
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -39,12 +42,19 @@ DELAY_SECONDS = int(os.getenv("DELAY_SECONDS", "30"))
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
 COOLDOWN_SECONDS = 91  # ~3 minutes cooldown after success OR "no OTP"
 
+# ✅ ADDED: Redis URL for shared watchlist storage
+REDIS_URL = os.getenv("REDIS_URL", "").strip()
+
 # Self-healing knobs (optional)
 RESTART_EVERY_MIN = int(os.getenv("RESTART_EVERY_MIN", "0"))  # 0 = disabled
 ERROR_RESTART_THRESHOLD = int(os.getenv("ERROR_RESTART_THRESHOLD", "6"))  # restart if this many network errors in a row
 # ---------------------------
 
 OTP_PATTERN = re.compile(r"\b(\d{6})\b")
+
+# ✅ ADDED: Redis keys for warning watcher
+WATCHLIST_KEY = "warn:watchlist"          # Redis SET of emails
+INTERVAL_KEY = "warn:interval_min"        # Redis STRING minutes
 
 # Track consecutive network-ish errors for auto-restart
 _CONSEC_ERRORS = 0
@@ -60,6 +70,10 @@ def _is_allowed_domain(email: str) -> bool:
 
 def _parse_ids(text: str):
     return [int(x) for x in re.findall(r"\d+", text or "")]
+
+
+# ✅ ADDED: Redis client (used by new /wadd /wremove /wlist /winterval commands)
+redis_client = redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
 
 
 class StateManager:
@@ -150,7 +164,7 @@ class StateManager:
 
     def unblock_email(self, email: str) -> bool:
         if email in self.state.get("blocked_emails", {}):
-            del self.state["blocked_emails"][email]
+            del self.state.get("blocked_emails", {})[email]
             self._save_state()
             return True
         return False
@@ -763,6 +777,185 @@ async def addusers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Added {after - before} users to subscribers.")
 
 
+# ✅ ADDED: Watchlist commands (admin only) using Redis
+async def wadd_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+    user = update.effective_user
+    if not user:
+        return
+
+    if user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+
+    if not REDIS_URL or redis_client is None:
+        await update.message.reply_text("❌ REDIS_URL is not set. Cannot use watchlist commands.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("❌ Usage: /wadd email@domain OR /wadd a@d.com,b@d.com")
+        return
+
+    raw = " ".join(context.args).strip().lower()
+    parts = re.split(r"[,\s]+", raw)
+    emails = [p.strip() for p in parts if p.strip()]
+
+    if not emails:
+        await update.message.reply_text("❌ No emails found.")
+        return
+
+    added = 0
+    already = 0
+    invalid = []
+
+    for email in emails:
+        if not _is_allowed_domain(email):
+            invalid.append(email)
+            continue
+        try:
+            ok = await redis_client.sadd(WATCHLIST_KEY, email)
+            if ok:
+                added += 1
+            else:
+                already += 1
+        except Exception as e:
+            await update.message.reply_text(f"❌ Redis error: {e}")
+            return
+
+    msg = f"✅ Added: {added}\nℹ️ Already in list: {already}"
+    if invalid:
+        msg += "\n❌ Invalid domain:\n" + "\n".join(f"• {e}" for e in invalid[:30])
+        if len(invalid) > 30:
+            msg += f"\n… +{len(invalid) - 30} more"
+
+    await update.message.reply_text(msg)
+
+
+async def wremove_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+    user = update.effective_user
+    if not user:
+        return
+
+    if user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+
+    if not REDIS_URL or redis_client is None:
+        await update.message.reply_text("❌ REDIS_URL is not set. Cannot use watchlist commands.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("❌ Usage: /wremove email@domain OR /wremove a@d.com,b@d.com")
+        return
+
+    raw = " ".join(context.args).strip().lower()
+    parts = re.split(r"[,\s]+", raw)
+    emails = [p.strip() for p in parts if p.strip()]
+
+    removed = 0
+    not_found = 0
+    invalid = []
+
+    for email in emails:
+        if not _is_allowed_domain(email):
+            invalid.append(email)
+            continue
+        try:
+            ok = await redis_client.srem(WATCHLIST_KEY, email)
+            if ok:
+                removed += 1
+            else:
+                not_found += 1
+        except Exception as e:
+            await update.message.reply_text(f"❌ Redis error: {e}")
+            return
+
+    msg = f"✅ Removed: {removed}\nℹ️ Not found: {not_found}"
+    if invalid:
+        msg += "\n❌ Invalid domain:\n" + "\n".join(f"• {e}" for e in invalid[:30])
+        if len(invalid) > 30:
+            msg += f"\n… +{len(invalid) - 30} more"
+
+    await update.message.reply_text(msg)
+
+
+async def wlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+    user = update.effective_user
+    if not user:
+        return
+
+    if user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+
+    if not REDIS_URL or redis_client is None:
+        await update.message.reply_text("❌ REDIS_URL is not set. Cannot use watchlist commands.")
+        return
+
+    try:
+        emails = await redis_client.smembers(WATCHLIST_KEY)
+        emails = sorted(list(emails))
+    except Exception as e:
+        await update.message.reply_text(f"❌ Redis error: {e}")
+        return
+
+    if not emails:
+        await update.message.reply_text("ℹ️ Watchlist empty.")
+        return
+
+    text = "📌 Watchlist:\n" + "\n".join(f"• {e}" for e in emails)
+    if len(text) > 3800:
+        text = text[:3800] + "\n…(trimmed)"
+    await update.message.reply_text(text)
+
+
+async def winterval_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+    user = update.effective_user
+    if not user:
+        return
+
+    if user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+
+    if not REDIS_URL or redis_client is None:
+        await update.message.reply_text("❌ REDIS_URL is not set. Cannot use watchlist commands.")
+        return
+
+    if not context.args:
+        try:
+            v = await redis_client.get(INTERVAL_KEY)
+        except Exception as e:
+            await update.message.reply_text(f"❌ Redis error: {e}")
+            return
+        current = v if v else "not set"
+        await update.message.reply_text(f"⏱️ Current interval: {current} minutes\nUsage: /winterval 30")
+        return
+
+    try:
+        n = int(context.args[0])
+        if n < 1 or n > 1440:
+            raise ValueError()
+    except ValueError:
+        await update.message.reply_text("❌ Invalid minutes. Use 1..1440")
+        return
+
+    try:
+        await redis_client.set(INTERVAL_KEY, str(n))
+    except Exception as e:
+        await update.message.reply_text(f"❌ Redis error: {e}")
+        return
+
+    await update.message.reply_text(f"✅ Interval set to {n} minutes.")
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Update {update} caused error {context.error}")
 
@@ -794,6 +987,12 @@ def _build_application() -> Application:
     app.add_handler(CommandHandler("log", showlog_command))
     app.add_handler(CommandHandler("dash", dash_command))
     app.add_handler(CommandHandler("addusers", addusers_command))
+
+    # ✅ ADDED: Watchlist handlers for warning watcher (admin only)
+    app.add_handler(CommandHandler("wadd", wadd_command))
+    app.add_handler(CommandHandler("wremove", wremove_command))
+    app.add_handler(CommandHandler("wlist", wlist_command))
+    app.add_handler(CommandHandler("winterval", winterval_command))
 
     app.add_error_handler(error_handler)
     return app
